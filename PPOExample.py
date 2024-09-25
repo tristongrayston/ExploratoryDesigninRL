@@ -1,42 +1,13 @@
 '''
-Actor Critic Methods will often have performance tanks after a certain amount
-of time due to being sensitive to perturbations. 
-This was the inspiration behind the PPO algorithm. Effectively the process
-of making the TRPO algorithm more efficient and less prone to mass fluctuations.
+Future Design tweaks:
 
-It does this by using what the paper calls 'clipped probability ratios'
-which is effectively comparing policies between timesteps to eachother 
-with a set lower bound. Basing the update of the policy between some 
-ratio of a new policy to the old. The term probability comes due to having
-0-1 as bounds.
+1. Dropout layer, does it help?
+2. Otherwise, some kind of normalization as data goes through the layers. 
+3. A more intelligent method of sampling through memories (right now, training on the most recent episode)
+4. Outputs right now go through a tanh activation to get it within the range of (-1, 1). This likely is a shitty solution.
+5. No clue if a synchronized model with diverging output layers is better than two distinct models. More work needs to be done here to figure that out.
 
-PPO also keeps 'memories' maybe similar to that of DQN. Multiple updates 
-to the network happen per data sample, which are carried out through
-minibatch stochastic gradient ascent. 
-
-Implementation notes: Memory
-We note that learning in this case is carried out through batches. 
-We keep a track of, say, 50 state transitions, then train on a batch 
-of 5-10-15 of them. The size of the batch is arbitrary for implementation 
-but there likely exists a best batch size. It seems to be the case that 
-the batches are carried out from iterative state transfers only. 
-
-Implementation notes: Critic
-Two distinct networks instead of shared inputs. 
-Actor decides to do based on the current state, and the critic evaluates states.
-
-Critic Loss:
-Return = advantage + critic value (from memory).
-then the L_critic = MSE(return - critic vlaue (from network))
-
-Networks outputs probabilities for an action distribution, therefore exploration is
-handled by definition. 
-
-Overview:
-Class for replay buffer, which can be implemented quite well with lists. 
-Class for actor network and critic network
-Class for the agent, tying everything together
-Main loop to train and evaluate
+6. This model is for a continuous output space, so our outputs are mean vals with constant variance. Likely, this is a mistake.
 
 '''
 
@@ -46,6 +17,7 @@ import torch as T
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
+from torch.distributions import Normal
 import time
 from Memory import PPOMemory
 
@@ -58,7 +30,7 @@ class Agent(nn.Module):
     
     def __init__(self, n_actions, c1, c2, input_dims, gamma=0.99, gae_lambda=0.95,
                  policy_clip=0.2, batch_size=64, buffer_size=32, n_epochs=10, 
-                 target_kl_div = 0.01,
+                 target_kl_div = 0.01, act_min_val = -1, act_max_val = 1,
                  actor_LR=1e-4, crit_LR=1e-4, annealing=True, continuous=False):
         
         super(Agent, self).__init__()
@@ -73,6 +45,8 @@ class Agent(nn.Module):
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.n_actions = n_actions
+        self.min_val = act_min_val
+        self.max_val = act_max_val
 
         #           --- Actor Critic ---
         self.actor = self._create_model(input_dims, n_actions, actor=True).float().to(device)
@@ -88,6 +62,9 @@ class Agent(nn.Module):
         self.target_kld = target_kl_div
         self.criterion = nn.MSELoss()
         self.continuous = continuous
+        if continuous == True:
+            self.variance = 0.3*T.ones(n_actions) # 0.3 is the current variance. We should probably change this.
+
         self.annealing = annealing
         if annealing == True:
             self.anneal_lr_actor = T.optim.lr_scheduler.StepLR(self.optimizer_actor, buffer_size*5, gamma=0.3)
@@ -109,17 +86,17 @@ class Agent(nn.Module):
             nn.Tanh(),
 
             nn.Linear(64, output_dims),
-            nn.Softmax(dim=-1)
+            nn.Tanh()
             )
             return model
         model = nn.Sequential(
             nn.Linear(input_dims, 64),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
 
             nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
 
             nn.Linear(64, output_dims)
         )
@@ -202,15 +179,26 @@ class Agent(nn.Module):
     
     def get_action_and_vf(self, x):
         ''' get distribution over actions and associated vf '''
+
+        # --- Discrete Actions ---
         if self.continuous == False:
             logits = self.actor(x)
-            #print(logits)
             probs = Categorical(logits=logits)
             action = probs.sample()
             return action, probs, probs.entropy(), self.critic.forward(x)
         
+        # --- Continuous Actions ---
         else:
-            logits = self.actor(x)
+            means = self.actor(x)
+            #print(means.tolist())
+            #print(type(means.tolist()))
+            distributions = Normal(means, self.variance) 
+            print(dist)
+            samples = distributions.sample(4)
+            samples_clamped = samples.clamp(self.min_val, self.max_val) 
+
+            return samples_clamped, samples, 0, self.critic.forward(x)
+
 
     def rollout(self, env, max_steps):
         """

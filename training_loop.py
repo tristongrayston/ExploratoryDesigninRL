@@ -6,7 +6,7 @@ from PPOExample import Agent as PPO
 import seaborn as sns
 
 
-env = gym.make("LunarLander-v2")
+env = gym.make("BipedalWalker-v3")
 device = T.device("cuda" if T.cuda.is_available() else "cpu")
 
 
@@ -20,7 +20,7 @@ TS_PER_ITER = 2000
 POLICY_MAX_TRAIN = 80
 CRITIC_MAX_TRAIN = 80
 
-PPO_Agent = PPO(n_actions=4, c1=1.0, c2=0.01, input_dims=8)
+PPO_Agent = PPO(n_actions=4, c1=1.0, c2=0.01, input_dims=24, continuous=True)
 
 # --- Bookkeeping ---
 eps_rewards = []
