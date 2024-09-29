@@ -15,7 +15,7 @@ observation, info = env.reset(seed=episode_seed)
 
 # --- HYPERPARAMETERS ---
 EPOCHS = 25
-ITERATIONS = 500
+ITERATIONS = 5000
 TS_PER_ITER = 2000
 POLICY_MAX_TRAIN = 80
 CRITIC_MAX_TRAIN = 80
@@ -42,12 +42,13 @@ for episode in range(ITERATIONS):
 
     obs = T.tensor(np.array(train_data[0])[permute_idx], dtype=T.float32, device=device)
     acts = T.tensor(np.array(train_data[1])[permute_idx], dtype=T.float32, device=device)
-    rew = T.tensor(np.array(train_data[2])[permute_idx], dtype=T.float32, device=device)
-    advantages = T.tensor(np.array(train_data[3])[permute_idx], dtype=T.float32, device=device)
-    act_log_probs = T.tensor(np.array(train_data[4])[permute_idx], dtype=T.float32, device=device)    
-    dones = T.tensor(np.array(train_data[5])[permute_idx], dtype=T.float32, device=device)    
+    #logits = T.tensor(np.array(train_data[2])[permute_idx], dtype=T.float32, device=device)
+    rew = T.tensor(np.array(train_data[3])[permute_idx], dtype=T.float32, device=device)
+    advantages = T.tensor(np.array(train_data[4])[permute_idx], dtype=T.float32, device=device)
+    act_log_probs = T.tensor(np.array(train_data[5])[permute_idx, :], dtype=T.float32, device=device)    
+    dones = T.tensor(np.array(train_data[6])[permute_idx], dtype=T.float32, device=device)    
 
-    returns = PPO_Agent.discount_rewards(train_data[2])[permute_idx]
+    returns = PPO_Agent.discount_rewards(train_data[3])[permute_idx]
 
     # --- Train Policy ---
     PPO_Agent.train_actor(obs, acts, act_log_probs, advantages, POLICY_MAX_TRAIN)
@@ -56,6 +57,19 @@ for episode in range(ITERATIONS):
     PPO_Agent.train_critic(obs, returns, CRITIC_MAX_TRAIN)
 
     print(ep_reward)
+
+env.close()
+
+# --- Evaluation Run ---
+
+# --- Remake gym with correct render mode ---
+env = gym.make("BipedalWalker-v3", render_mode="human")
+observation, info = env.reset(seed=episode_seed)
+
+# --- Set to evaluation mode ---
+PPO_Agent.actor.eval()
+
+train_data, ep_reward = PPO_Agent.rollout(env, TS_PER_ITER)
 
 print(eps_rewards)
 
