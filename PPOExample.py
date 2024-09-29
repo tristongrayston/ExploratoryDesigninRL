@@ -8,6 +8,8 @@ Future Design tweaks:
 5. No clue if a synchronized model with diverging output layers is better than two distinct models. More work needs to be done here to figure that out.
 
 6. This model is for a continuous output space, so our outputs are mean vals with constant variance. Likely, this is a mistake.
+7. Some people randomize the data as it goes in through the model... Why? Does that cause a performance boost?
+
 
 '''
 
@@ -168,6 +170,8 @@ class Agent(nn.Module):
         # This is only important if you're running on GPU
         values = T.stack(values).detach().cpu().numpy()
 
+        #print("rewards", rewards, "values: ", values)
+
         next_values = np.concatenate([values[1:], [[0]]])
         deltas = [rew + gamma * next_val - val for rew, val, next_val in zip(rewards, values, next_values)]
 
@@ -175,10 +179,17 @@ class Agent(nn.Module):
         for i in reversed(range(len(deltas)-1)):
             gaes.append(deltas[i] + decay * gamma * gaes[-1])
 
+       # gaes = np.array(gaes)
         return np.array(gaes[::-1])
     
     def get_action_and_vf(self, x):
-        ''' get distribution over actions and associated vf '''
+        ''' get distribution over actions and associated vf 
+            returns: 
+                action, 
+                prob of those actions (or distributions if continuous), 
+                entropy, 
+                vf.
+        '''
 
         # --- Discrete Actions ---
         if self.continuous == False:
@@ -190,14 +201,11 @@ class Agent(nn.Module):
         # --- Continuous Actions ---
         else:
             means = self.actor(x)
-            #print(means.tolist())
-            #print(type(means.tolist()))
-            distributions = Normal(means, self.variance) 
-            print(dist)
-            samples = distributions.sample(4)
+            distributions = Normal(means, self.variance) # Torch method, should allow log_probs 
+            samples = distributions.sample()
             samples_clamped = samples.clamp(self.min_val, self.max_val) 
 
-            return samples_clamped, samples, 0, self.critic.forward(x)
+            return samples_clamped, distributions, 0, self.critic.forward(x)
 
 
     def rollout(self, env, max_steps):
@@ -207,7 +215,7 @@ class Agent(nn.Module):
         Noteworthy: the implementation here (I think) will turn training data into batches per episode. Maybe that is 
         the way to go? I'm thinking bootstrapping after some 16th step might be better. Not quite sure.
         """
-        train_data = [[], [], [], [], [], []] # obs, action, rewards, values, act_log_probs, dones
+        train_data = [[], [], [], [], [], [], []] # obs, action, distributions, rewards, values, act_log_probs, dones
         obs, _ = env.reset()
 
         ep_reward = 0.0
@@ -215,10 +223,12 @@ class Agent(nn.Module):
         # --- Perform Rollout ---
         for _ in range(max_steps):
             action, logits, entropy, vals = self.get_action_and_vf(T.tensor(obs, dtype=T.float32, device=device))
-            log_prob = logits.log_prob(action).item()
+            log_prob = logits.log_prob(action).detach().tolist()
 
-            next_obs, reward, done, trun, _ = env.step(action.item())
-            for i, item in enumerate((obs, action.item(), reward, vals, log_prob, done)):
+            action = action.tolist()
+
+            next_obs, reward, done, trun, _ = env.step(action)
+            for i, item in enumerate((obs, action, logits, reward, vals, log_prob, done)):
                 train_data[i].append(item)
 
             obs = next_obs
@@ -228,7 +238,7 @@ class Agent(nn.Module):
         
         # --- Get GAE, replacing values with advantages. --- 
         
-        train_data[3] = self.calculate_gaes(train_data[2], train_data[3])
+        train_data[4] = self.calculate_gaes(train_data[3], train_data[4])
         return train_data, ep_reward
 
     def train_actor(self, obs, actions,
@@ -243,9 +253,19 @@ class Agent(nn.Module):
 
             # --- Get Ratio ---
 
-            logits = self.actor(obs)
-            logits = Categorical(logits)
-            log_probs = logits.log_prob(actions) 
+            if self.continuous == True:
+                means = self.actor(obs)
+                distributions = Normal(means, self.variance) # Torch method, should allow log_probs 
+                samples = distributions.sample()
+                samples_clamped = samples.clamp(self.min_val, self.max_val) 
+                log_probs = distributions.log_prob(samples_clamped)
+
+            else:
+                logits = self.actor(obs)
+                logits = Categorical(logits)
+                log_probs = logits.log_prob(actions) 
+
+            
             prob_ratios = T.exp(log_probs - act_log_probs).to(device)
 
             # --- Clip Loss ---
@@ -376,10 +396,4 @@ class Agent(nn.Module):
         #print(self.memory.vals.shape)
 
         return policy_loss.detach(), crit_loss.detach(), loss.detach(), maximum_ratio
-
-        
-
-
-##A
-    
     
