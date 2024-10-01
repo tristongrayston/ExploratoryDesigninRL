@@ -31,7 +31,7 @@ class Agent(nn.Module):
         # food for thought.
     
     def __init__(self, n_actions, c1, c2, input_dims, gamma=0.99, gae_lambda=0.95,
-                 policy_clip=0.2, batch_size=64, buffer_size=32, n_epochs=10, 
+                 policy_clip=0.2, batch_size=128, buffer_size=32, n_epochs=10, 
                  target_kl_div = 0.01, act_min_val = -1, act_max_val = 1,
                  actor_LR=1e-4, crit_LR=1e-4, annealing=True, continuous=False):
         
@@ -65,7 +65,12 @@ class Agent(nn.Module):
         self.criterion = nn.MSELoss()
         self.continuous = continuous
         if continuous == True:
-            self.variance = 0.3*T.ones(n_actions) # 0.3 is the current variance. We should probably change this.
+            self.variance = 0.05*T.ones(n_actions) # 0.3 is the current variance. We should probably change this.
+
+        self.POLICY_MAX_TRAIN = 40
+        self.CRITIC_MAX_TRAIN = 40
+
+        self.epochs = 3
 
         self.annealing = annealing
         if annealing == True:
@@ -73,6 +78,8 @@ class Agent(nn.Module):
             self.anneal_lr_critic = T.optim.lr_scheduler.StepLR(self.optimizer_critic, buffer_size*5, gamma=0.3)
 
         self.training_steps = 0
+
+        self.eval = False
     
 
     def _create_model(self, input_dims, output_dims, actor):
@@ -80,17 +87,18 @@ class Agent(nn.Module):
         if actor == True:
             model = nn.Sequential(
             nn.Linear(input_dims, 64),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
 
             nn.Linear(64, 64),
-            nn.Tanh(),
+            nn.ReLU(),
 
             nn.Linear(64, output_dims),
             nn.Tanh()
             )
             return model
+        
         model = nn.Sequential(
             nn.Linear(input_dims, 64),
             nn.ReLU(),
@@ -179,8 +187,12 @@ class Agent(nn.Module):
         for i in reversed(range(len(deltas)-1)):
             gaes.append(deltas[i] + decay * gamma * gaes[-1])
 
-       # gaes = np.array(gaes)
-        return np.array(gaes[::-1])
+        # normalize advantages, maybe we turn this into a variable for testing purposes down the line.
+        gaes = np.array(gaes[::-1])
+
+        gaes = (gaes - np.mean(gaes)) / (np.std(gaes) + 1e-8)
+
+        return gaes
     
     def get_action_and_vf(self, x):
         ''' get distribution over actions and associated vf 
@@ -202,7 +214,7 @@ class Agent(nn.Module):
         else:
             means = self.actor(x)
             distributions = Normal(means, self.variance) # Torch method, should allow log_probs 
-            samples = distributions.sample()
+            samples = distributions.rsample()
             samples_clamped = samples.clamp(self.min_val, self.max_val) 
 
             return samples_clamped, distributions, 0, self.critic.forward(x)
@@ -215,7 +227,6 @@ class Agent(nn.Module):
         Noteworthy: the implementation here (I think) will turn training data into batches per episode. Maybe that is 
         the way to go? I'm thinking bootstrapping after some 16th step might be better. Not quite sure.
         """
-        train_data = [[], [], [], [], [], [], []] # obs, action, distributions, rewards, values, act_log_probs, dones
         obs, _ = env.reset()
 
         ep_reward = 0.0
@@ -228,24 +239,39 @@ class Agent(nn.Module):
             action = action.tolist()
 
             next_obs, reward, done, trun, _ = env.step(action)
-            for i, item in enumerate((obs, action, logits, reward, vals, log_prob, done)):
-                train_data[i].append(item)
 
+            if self.eval == False:
+                # --- Store in memory ---
+                for i, item in enumerate((obs, action, logits, reward, vals, log_prob, done)):
+                    self.memory.tmp_storage[i].append(item)
+            
             obs = next_obs
             ep_reward += reward 
             if done:
                 break
         
         # --- Get GAE, replacing values with advantages. --- 
+    
+        if self.eval == False:
+            self.memory.tmp_storage[4] = self.calculate_gaes(self.memory.tmp_storage[3], 
+                                                                self.memory.tmp_storage[4])
+                                                                #self.memory.tmp_storage[6])
+            
+            #print(self.memory.tmp_storage[4])
+            self.memory.tmp_storage[3] = self.discount_rewards(self.memory.tmp_storage[3])
+            self.memory.create_batch()
+
+            if self.memory.batch_memory_size > 2:
+                self.learn()
+
         
-        train_data[4] = self.calculate_gaes(train_data[3], train_data[4])
-        return train_data, ep_reward
+        #train_data[4] = self.calculate_gaes(train_data[3], train_data[4])
+        return ep_reward
 
     def train_actor(self, obs, actions,
                     act_log_probs, adv_tensor, max_train_steps):
         '''
-        Function that trains specifically the policy network. Admittedly, might need to make some changes to the model
-        as we have no shared layers.
+        todo: make this
         '''
         for train_step in range(max_train_steps):
             # Forget gradients from last learning step
@@ -260,6 +286,9 @@ class Agent(nn.Module):
                 samples_clamped = samples.clamp(self.min_val, self.max_val) 
                 log_probs = distributions.log_prob(samples_clamped)
 
+                # --- Entropy Loss ---
+                entropy = distributions.entropy().mean()
+
             else:
                 logits = self.actor(obs)
                 logits = Categorical(logits)
@@ -273,6 +302,10 @@ class Agent(nn.Module):
 
             # --- Full Policy Loss --- 
             policy_loss = -(T.min(prob_ratios*adv_tensor, clip_loss*adv_tensor)).mean()
+
+            if self.continuous == True:
+                policy_loss += entropy
+
             policy_loss.backward()
 
             self.optimizer_actor.step()
@@ -294,6 +327,10 @@ class Agent(nn.Module):
 
             val = self.critic(obs)
             loss = (val - returns)**2
+
+            # --- Clip VF ---
+
+            loss = loss.clamp(-1, +1)
             loss = loss.mean()
 
             # --- Backwards --- 
@@ -303,97 +340,13 @@ class Agent(nn.Module):
 
     def learn(self):
         '''
-        This function is responsible for the backpropogation and learning of our agent. 
-        It learns on minibatches and is called until the entire buffer is empty from the minibatch called. 
+        Lots of tediousness with getting this to work, so we can make a function that helps out with this
         '''
+        # train in epochs, don't nessessarily need to train on one rollout.
 
-        # Certain things need to be done relative to the entire buffer, such as reward scaling.
-        reward_std = np.array(self.memory.rewards).std()
-        reward_mean = np.array(self.memory.rewards).mean()
-        
-        for _ in range(self.buffer_size):
+        for _ in range(self.epochs):
+            batch = self.memory.return_batch()
 
-            # Forget gradients from last learning step
-            self.optimizer_actor.zero_grad()
-            self.optimizer_critic.zero_grad()
+            self.train_actor(batch[0], batch[1], batch[5], batch[4], self.POLICY_MAX_TRAIN)
+            self.train_critic(batch[0], batch[2], self.CRITIC_MAX_TRAIN)
 
-            # retrieve memories from last batch
-            state_tens, act_logprob_tens, vals_tens, act_tens, rew_tens, dones_tens = self.memory.get_memory_batch()
-
-            # clip rewards
-            rew_tens = T.clamp(rew_tens, -1.0, 1.0)
-
-            # Retrieve advantages and returns for this minibatch
-            adv_tensor, returns = self.get_gae_and_returns(rew_tens, vals_tens, reward_std, reward_mean, dones_tens)
-            
-            #           --- Actor and Entropy Loss ---
-
-            # Send our state through our actors
-            logits=self.actor(state_tens).to(device)
-            #print(logits)
-            new_probs = Categorical(logits)
-
-            # get prob of our action
-            prob_of_action = new_probs.log_prob(act_tens)
-
-            # Entropy Loss
-            entropy_loss = T.mean(new_probs.entropy()).to(device)
-
-            # Get probability raio
-            prob_ratios = T.exp(prob_of_action - act_logprob_tens).to(device)
-
-            maximum_ratio = T.max(prob_ratios).detach().numpy()
-
-            # Clip Max Tensor
-            clip_max = T.tensor(1+self.policy_clip, dtype=T.float32).expand(self.batch_size, 1).to(device)
-
-            # Clip Min Tensor
-            clip_min =  T.tensor(1-self.policy_clip, dtype=T.float32).expand(self.batch_size, 1).to(device)
-
-
-            # policy loss
-            policy_loss = (T.min((prob_ratios), T.clamp(prob_ratios, clip_min, clip_max))*adv_tensor).to(device)
-            policy_loss = T.mean(policy_loss).to(device)
-
-            #           --- Critic Loss ---
-
-            approx_val = T.flatten(self.critic.forward(state_tens))
-            
-            crit_loss = self.criterion(approx_val, returns)
-
-            # Implementation detail in 'Implementation Matters in Deep Policy Gradients'
-            crit_loss_clip = T.clamp(crit_loss, 1-self.policy_clip, 1+self.policy_clip)
-            crit_loss = T.min(crit_loss, crit_loss_clip)
-            crit_loss = crit_loss.float()
-
-            #           --- Total Loss ---
-
-            # Implementation detail in 'Implementation Matters in Deep Policy Gradients'
-            # No entropy loss
-            loss = -policy_loss + self.c1*crit_loss # - self.c2*entropy_loss
-
-            #print('policy_loss: ', policy_loss)
-            #print('crit loss: ', crit_loss)
-            #print('entropy loss: ', entropy_loss)
-            #print(loss)
-
-            # backward pass
-            loss.backward()
-
-            self.optimizer_actor.step()
-            self.optimizer_critic.step()
-
-            if self.annealing == True:
-                self.anneal_lr_actor.step()
-                self.anneal_lr_critic.step()
-                #print("### Learning Rate : ", self.anneal_lr_actor.get_last_lr() , " ###")
-                #self.training_steps += 1
-
-            # Exponential Decay on C2
-            self.c2 *= 0.999
-
-
-        #print(self.memory.vals.shape)
-
-        return policy_loss.detach(), crit_loss.detach(), loss.detach(), maximum_ratio
-    

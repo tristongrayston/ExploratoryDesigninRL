@@ -18,15 +18,12 @@ What we could do to circumnavigate this is implement a queue of batches in memor
 
 '''
 
+# obs, action, distributions, rewards, values, act_log_probs, dones
+
 class PPOMemory:
     def __init__(self, batch_size, max_batches=300):
         # we keep memory in mind with lists
-        self.states = []
-        self.actions = []
-        self.logprobs = []
-        self.vals = []
-        self.rewards = []
-        self.dones = []
+        self.tmp_storage = [[], [], [], [], [], [], []] # obs, action, distributions, rewards, values, act_log_probs, dones
         self.batch_size = batch_size
         
         #Batch queue
@@ -34,54 +31,54 @@ class PPOMemory:
         self.batch_memory_size = len(self.batch_memory)
         self.max_batches = max_batches
 
-    def store_memory(self, state, action, probs, vals, reward, done):
+    def store_memory(self, obs, action, rewards, values, act_log_probs, dones):
         
-        # Store our vals into our queue
-        self.states.append(state)
-        self.actions.append(action)
-        self.logprobs.append(probs)
-        self.vals.append(vals)
-        self.rewards.append(reward)
-        self.dones.append(done)
+        # --- Store values into buffer ---
+        self.states = obs
+        self.actions = action
+        self.rewards = rewards
+        self.logprobs = act_log_probs
+        self.vals = values
+        
+        self.dones = dones
 
         # If we have enough memories to store a batch, then store a batch.
-        if len(self.states) >= self.batch_size:
-            self._create_batch()
+        #if len(self.states) >= self.batch_size:
+        #    self._create_batch()
 
     def _clear_tmp_memory(self):
-        self.states = []
-        self.logprobs = []
-        self.vals = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
+        self.tmp_storage = [[], [], [], [], [], [], []]
 
-    def _create_batch(self):
+    def create_batch(self):
         ''' Returns a memory batch of size batch_size. '''
 
-        # retrieves the batch_size states
-        states_T = T.stack(self.states[:self.batch_size]).to(device)
-        act_logprob_tens = T.tensor(self.logprobs[:self.batch_size]).to(device)
-        vals_tens = T.tensor(self.vals[:self.batch_size], dtype=T.float32).to(device)
-        act_tens = T.tensor(self.actions[:self.batch_size]).to(device)
-        rew_tens = T.tensor(self.rewards[:self.batch_size]).to(device)
-        dones_tens = T.tensor(self.dones[:self.batch_size]).to(device)
+        # --- Replace vf with advantages ---
 
-        # Check the size of our batch memory
+        # Neat trick, thanks Eden Meyers! 
+        permute_idx = np.random.permutation(len(self.tmp_storage))
+
+        obs = T.tensor(np.array(self.tmp_storage[0])[permute_idx], dtype=T.float32, device=device)
+        acts = T.tensor(np.array(self.tmp_storage[1])[permute_idx], dtype=T.float32, device=device)
+        #logits = T.tensor(np.array(self.tmp_storage[2])[permute_idx], dtype=T.float32, device=device)
+        rew = T.tensor(np.array(self.tmp_storage[3])[permute_idx], dtype=T.float32, device=device)
+        advantages = T.tensor(np.array(self.tmp_storage[4])[permute_idx], dtype=T.float32, device=device)
+        act_log_probs = T.tensor(np.array(self.tmp_storage[5])[permute_idx], dtype=T.float32, device=device)    
+        dones = T.tensor(np.array(self.tmp_storage[6])[permute_idx], dtype=T.float32, device=device)    
+
+        # --- Check the size of our batch memory ---
         
         if self.batch_memory_size > self.max_batches:
             rnd_index = np.randint(0, self.batch_memory_size)
             del self.batch_memory[rnd_index]
 
-        # Put a tuple of tensors in the batch memory
-        self.batch_memory.append((states_T, act_logprob_tens, vals_tens, act_tens, rew_tens, dones_tens))
+        # --- Put a tuple of tensors in the batch memory ---
+        self.batch_memory.append((obs, acts, rew, advantages, act_log_probs, dones))
 
-        # clear our temp memory
-
+        # --- Clear our temp memory ---
         self._clear_tmp_memory()
 
     def return_batch(self):
-        rnd_index = np.randint(0, self.batch_memory_size)
+        rnd_index = np.random.randint(0, self.batch_memory_size)
         return self.batch_memory[rnd_index]
         
 
